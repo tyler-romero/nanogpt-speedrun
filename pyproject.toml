@@ -1,0 +1,20 @@
+[project]
+name = "nanogpt-speedrun"
+version = "0.1.0"
+dependencies = [
+    "numpy",
+    "torch",
+    "huggingface-hub",
+    "wandb",
+]
+
+[project.optional-dependencies]
+data = [
+    "datasets",
+    "tiktoken",
+    "tqdm"
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
