@@ -18,3 +18,13 @@ data = [
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+include = ["*.py"]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

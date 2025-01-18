@@ -433,7 +433,6 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "torch" },
-    { name = "tqdm" },
     { name = "wandb" },
 ]
 
@@ -441,6 +440,7 @@ dependencies = [
 data = [
     { name = "datasets" },
     { name = "tiktoken" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -450,7 +450,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "tiktoken", marker = "extra == 'data'" },
     { name = "torch" },
-    { name = "tqdm" },
+    { name = "tqdm", marker = "extra == 'data'" },
     { name = "wandb" },
 ]
 

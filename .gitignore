@@ -174,3 +174,4 @@ cython_debug/
 *.bin
 logs/
 wandb/
+.vscode/
