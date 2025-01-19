@@ -3,16 +3,21 @@ name = "nanogpt-speedrun"
 version = "0.1.0"
 dependencies = [
     "numpy",
-    "torch",
-    "huggingface-hub",
+    "torch>=2.5.0",
     "wandb",
 ]
 
 [project.optional-dependencies]
 data = [
     "datasets",
+    "huggingface-hub",
     "tiktoken",
     "tqdm"
+]
+dev = [
+    "ipykernel",
+    "matplotlib",
+    "seaborn"
 ]
 
 [build-system]
