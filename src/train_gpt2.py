@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 
@@ -27,6 +28,99 @@ import wandb
 
 # speedrun is to <= this val_loss. A val loss of <3.278 is good evidence that >95% of runs attain below 3.28
 SPEEDRUN_TARGET = 3.28
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+# Reference: https://kellerjordan.github.io/posts/muon/
+
+
+def zeropower_via_svd(G, steps=None):
+    U, S, V = G.svd()
+    return U @ V.T
+
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16() / (G.norm() + eps)  # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = A @ X
+        X = a * X + b * B + c * A @ B
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X.to(G.dtype)
+
+
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon: MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+    """
+
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+                if g.size(0) == 3 * g.size(1):  # split grouped QKV parameters
+                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
+                    scale = g.size(1) ** 0.5
+                else:
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    scale = max(g.size(0), g.size(1)) ** 0.5  # scale to have update.square().mean() == 1
+                p.data.add_(g, alpha=-lr * scale)
+
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -123,14 +217,6 @@ class Block(nn.Module):
 # The main GPT-2 model
 
 
-@dataclass
-class GPTConfig:
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-
-
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -169,10 +255,6 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas)
-        return optimizer
 
 
 # -----------------------------------------------------------------------------
@@ -268,26 +350,40 @@ def print0(s, console=False):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train a GPT model.')
+    parser.add_argument('--disable_wandb', action='store_true', help='Disable wandb logging.')
+    parser.add_argument('--notes', type=str, default=None, help='Notes for the run, will be logged to wandb.')
 
     @dataclass
     class Hyperparameters:
         input_bin: str = 'src/data/fineweb10B/fineweb_train_*.bin'
         input_val_bin: str = 'src/data/fineweb10B/fineweb_val_*.bin'
-        batch_size = 512  # global batch size, in sequences
+        batch_size = 16 * 32  # global batch size, in sequences
         device_batch_size: int = 32  # batch size, in sequences, per device
         sequence_length: int = 1024  # sequence length, in tokens
-        num_iterations: int = 9664  # number of iterations to run
-        learning_rate: float = 0.0018
-        warmup_iters: int = 256
-        warmdown_iters: int = 2048
-        weight_decay: float = 0.1
+        num_iterations: int = 5800  # number of iterations to run
+        learning_rate: float = 0.0036
+        warmup_iters: int = 0
+        warmdown_iters: int = 1450
+        weight_decay: float = 0.0
         val_loss_every: int = 128
         val_tokens: int = (
             10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
         )
         disable_wandb: bool = False
 
+    @dataclass
+    class GPTConfig:
+        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested by @Grad62304977.
+        # this originates from Karpathy's experiments. this might be more relevant for H100 runs.
+        vocab_size: int = 50304
+        n_layer: int = 12
+        n_head: int = 12
+        n_embd: int = 768
+
+    parsed_args = parser.parse_args()
     args = Hyperparameters()
+    args.disable_wandb = parsed_args.disable_wandb
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
@@ -320,11 +416,11 @@ if __name__ == '__main__':
         print0(logfile, console=True)
         # initialize wandb
         if not args.disable_wandb:
-            wandb.init(project='nanogpt-speedrun', name=str(run_id), config=args)
+            wandb.init(project='nanogpt-speedrun', name=str(run_id), config=args, notes=parsed_args.notes)
 
     print0(f'Running pytorch {torch.version.__version__}')
     print(f'using device: {device}')
-
+    print0(f'Hyperparameters: {args}', console=True)
     print0(
         f'{B=} {T=} {ddp_world_size=} {grad_accum_steps=} {tokens_per_fwdbwd=} {args.batch_size=}',
         console=True,
@@ -341,13 +437,13 @@ if __name__ == '__main__':
     print0('=' * 100)
 
     # init the model from scratch
-    # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested by @Grad62304977.
-    model_config = GPTConfig(vocab_size=50304, n_layer=12, n_head=12, n_embd=768)
+    model_config = GPTConfig()
+    print0(f'Model Config: {model_config}', console=True)
     model = GPT(model_config)
     model = model.train().cuda()
     if hasattr(config, 'coordinate_descent_tuning'):
         config.coordinate_descent_tuning = True  # suggested by @Chillee
-    print0('compiling the model...')
+    print0('compiling the model...', console=True)
     model = torch.compile(model)
     ddp_model = DDP(model, device_ids=[ddp_local_rank])
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
@@ -359,26 +455,35 @@ if __name__ == '__main__':
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
     x, y = train_loader.next_batch()
 
-    # init the optimizer
-    optimizer = model.configure_optimizers(
-        weight_decay=args.weight_decay,
-        learning_rate=args.learning_rate,
+    # init the optimizer(s)
+    optimizer1 = torch.optim.AdamW(
+        model.lm_head.parameters(),
+        lr=args.learning_rate,
         betas=(0.9, 0.95),
+        weight_decay=args.weight_decay,
     )
+    optimizer2 = Muon(
+        model.transformer.h.parameters(),
+        lr=0.1 * args.learning_rate,
+        momentum=0.95,
+    )
+    optimizers = [optimizer1, optimizer2]
 
     # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
         assert it <= args.num_iterations
         # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
-            return args.learning_rate * (it + 1) / args.warmup_iters
+            return (it + 1) / args.warmup_iters
         # 2) constant lr for a while
         elif it < args.num_iterations - args.warmdown_iters:
-            return args.learning_rate
+            return 1.0
         # 3) linear warmdown
         else:
             decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-            return args.learning_rate * decay_ratio
+            return decay_ratio
+
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
     tokens_seen = 0
     training_time_ms = 0
@@ -435,7 +540,9 @@ if __name__ == '__main__':
 
             # if we hit the speedrun target, we're done
             if val_loss <= SPEEDRUN_TARGET:
-                break
+                print0(
+                    f'Speedrun target achieved at step {step} with val_loss {val_loss:.4f} at time {training_time_ms:.2f}ms !'
+                )
 
         # bit confusing: we want to make sure to eval on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
@@ -447,21 +554,24 @@ if __name__ == '__main__':
         # --------------- TRAINING SECTION BEGIN -----------------
         model.train()
         x, y = train_loader.next_batch()
-        with ctx:
-            # forward/backward with grad accumulation
-            for i, (micro_x, micro_y) in enumerate(
-                zip(x.chunk(grad_accum_steps, dim=0), y.chunk(grad_accum_steps, dim=0))
-            ):
+        # forward/backward with grad accumulation
+        for i, (micro_x, micro_y) in enumerate(zip(x.chunk(grad_accum_steps, dim=0), y.chunk(grad_accum_steps, dim=0))):
+            with ctx:
                 _, loss = ddp_model(micro_x, micro_y, return_logits=False)
                 train_loss = loss.detach()
-                loss.backward()
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            if i < grad_accum_steps:
+                with ddp_model.no_sync():  # there's no need to sync gradients every accumulation step
+                    loss.backward()
+            else:
+                loss.backward()  # sync on the last step
+        for p in model.parameters():
+            p.grad /= grad_accum_steps
         # step the optimizer
-        optimizer.step()
+        for optimizer, scheduler in zip(optimizers, schedulers):
+            optimizer.step()
+            scheduler.step()
         # null the gradients
-        optimizer.zero_grad(set_to_none=True)
+        ddp_model.zero_grad(set_to_none=True)
 
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
@@ -483,7 +593,7 @@ if __name__ == '__main__':
                         'step': step + 1,
                         'step_avg': approx_time / timed_steps,
                         'tokens_seen': tokens_seen,
-                        'lr': lr,
+                        'lr_schedule': get_lr(step),
                         'tokens_per_second': tokens_per_second,
                     }
                 )
