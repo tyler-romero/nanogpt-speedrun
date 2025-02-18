@@ -291,22 +291,11 @@ class GPT(nn.Module):
             x = block(x)
         x = F.rms_norm(x, (x.size(-1),))
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            logits = logits.float()  # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
-            logits = logits.float()  # use tf32/fp32 for logits
-            loss = None
-
-        # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits:
-            logits = None
-
-        return logits, loss
+        # if we are given some desired targets also calculate the loss
+        logits = self.lm_head(x)
+        logits = logits.float()  # use tf32/fp32 for logits
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        return loss
 
 
 # -----------------------------------------------------------------------------
@@ -409,18 +398,16 @@ if __name__ == '__main__':
     class Hyperparameters:
         input_bin: str = 'src/data/fineweb10B/fineweb_train_*.bin'
         input_val_bin: str = 'src/data/fineweb10B/fineweb_val_*.bin'
-        batch_size = 16 * 32  # global batch size, in sequences
+        batch_size = 2 * 8 * 32  # global batch size, in sequences
         device_batch_size: int = 32  # batch size, in sequences, per device
         sequence_length: int = 1024  # sequence length, in tokens
-        num_iterations: int = 5800  # number of iterations to run
+        num_iterations: int = 6312  # number of iterations to run
         learning_rate: float = 0.0036
         warmup_iters: int = 0
         warmdown_iters: int = 1450
         weight_decay: float = 0.0
         val_loss_every: int = 128
-        val_tokens: int = (
-            10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-        )
+        val_tokens: int = 10_485_760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons (2^21 * 5)
         disable_wandb: bool = False
         memory_snapshot_steps: int = -1  # -1 to disable
 
@@ -432,6 +419,7 @@ if __name__ == '__main__':
         n_layer: int = 12
         n_head: int = 12
         n_embd: int = 768
+        # head_dim = n_embd // n_head
 
     parsed_args = parser.parse_args()
     args = Hyperparameters()
@@ -457,8 +445,8 @@ if __name__ == '__main__':
     val_steps = args.val_tokens // (B * T * ddp_world_size)
     # calculate the steps of gradient accumulation required to attain the desired global batch size.
     assert args.batch_size % (B * ddp_world_size) == 0
-    grad_accum_steps = args.batch_size // (B * ddp_world_size)
-    tokens_per_fwdbwd = B * T * ddp_world_size * grad_accum_steps  # 524288
+    train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+    tokens_per_fwdbwd = B * T * ddp_world_size * train_accumulation_steps  # 524288
 
     # begin logging
     if master_process:
@@ -474,7 +462,7 @@ if __name__ == '__main__':
     print(f'using device: {device}')
     print0(f'Hyperparameters: {args}', console=True)
     print0(
-        f'{B=} {T=} {ddp_world_size=} {grad_accum_steps=} {tokens_per_fwdbwd=} {args.batch_size=}',
+        f'{B=} {T=} {ddp_world_size=} {train_accumulation_steps=} {tokens_per_fwdbwd=} {args.batch_size=}',
         console=True,
     )
 
@@ -502,10 +490,17 @@ if __name__ == '__main__':
     print0(f'Initing model required {mem_used:.1f}GB vram', console=True)
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B * grad_accum_steps, T, ddp_rank, ddp_world_size)
-    val_loader = None
-    if args.input_val_bin:
-        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    print0(
+        f'Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files',
+        console=True,
+    )
+    print0(
+        f'Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files',
+        console=True,
+    )
+
     x, y = train_loader.next_batch()
 
     # init the optimizer(s)
@@ -569,13 +564,13 @@ if __name__ == '__main__':
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.perf_counter() - t0)
             # run validation batches
-            model.eval()
+            ddp_model.eval()
             val_loader.reset()
             val_loss = 0.0
             for _ in range(val_steps):
                 x_val, y_val = val_loader.next_batch()
                 with ctx:  # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                    _, loss = model(x_val, y_val, return_logits=False)
+                    loss = ddp_model(x_val, y_val)
                     val_loss += loss.detach()
                     del loss
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -611,20 +606,22 @@ if __name__ == '__main__':
             break
 
         # --------------- TRAINING SECTION BEGIN -----------------
-        model.train()
-        x, y = train_loader.next_batch()
-        # forward/backward with grad accumulation
-        for i, (micro_x, micro_y) in enumerate(zip(x.chunk(grad_accum_steps, dim=0), y.chunk(grad_accum_steps, dim=0))):
+        ddp_model.train()
+        for i in range(1, train_accumulation_steps + 1):
+            # forward pass
             with ctx:
-                _, loss = ddp_model(micro_x, micro_y, return_logits=False)
-                train_loss = loss.detach()
-            if i < grad_accum_steps:
+                loss = ddp_model(x, y)
+            # advance the dataset for the next batch
+            x, y = train_loader.next_batch()
+            # backward pass
+            if i < train_accumulation_steps:
                 with ddp_model.no_sync():  # there's no need to sync gradients every accumulation step
                     loss.backward()
             else:
+                train_loss = loss.detach()
                 loss.backward()  # sync on the last step
-        for p in model.parameters():
-            p.grad /= grad_accum_steps
+        for p in ddp_model.parameters():
+            p.grad /= train_accumulation_steps
         # step the optimizer
         for optimizer, scheduler in zip(optimizers, schedulers):
             optimizer.step()
