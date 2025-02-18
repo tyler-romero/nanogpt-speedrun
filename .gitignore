@@ -173,5 +173,6 @@ cython_debug/
 # repo specific
 *.bin
 logs/
+profiling/
 wandb/
 .vscode/

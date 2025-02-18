@@ -9,7 +9,8 @@ This repo is heavily influced by https://github.com/KellerJordan/modded-nanogpt.
 See also: https://github.com/karpathy/llm.c/discussions/481 and https://github.com/tysam-code/hlb-gpt
 
 
-## setup
+## setup and run
+Install dependencies, download data, and start training with the following commands:
 
 ```bash
 uv sync --all-extras

@@ -6,14 +6,15 @@ with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
 
 import glob
+import socket
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import torch
-import torch._inductor.config as config
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
@@ -28,6 +29,57 @@ import wandb
 
 # speedrun is to <= this val_loss. A val loss of <3.278 is good evidence that >95% of runs attain below 3.28
 SPEEDRUN_TARGET = 3.28
+
+# -----------------------------------------------------------------------------
+# Memory Snapshotting
+# https://pytorch.org/blog/understanding-gpu-memory-1/#capturing-memory-snapshots
+# https://pytorch.org/memory_viz
+
+# Keep a max of 100,000 alloc/free events in the recorded history
+# leading up to the snapshot.
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
+PROFILING_DIR = './profiling'
+os.makedirs(PROFILING_DIR, exist_ok=True)
+
+
+def start_record_memory_history() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError()
+
+    print0('Starting snapshot record_memory_history', console=True)
+    torch.cuda.memory._record_memory_history(max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT)
+
+
+def stop_record_memory_history() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError()
+
+    print0('Stopping snapshot record_memory_history', console=True)
+    torch.cuda.memory._record_memory_history(enabled=None)
+
+
+def export_memory_snapshot() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError()
+
+    host_name = socket.gethostname()
+    timestamp = datetime.now().timestamp()
+    file_prefix = f'{host_name}_{timestamp}'
+    file_name = f'{PROFILING_DIR}/{file_prefix}.pickle'
+
+    try:
+        print(f'Saving snapshot to local file: {file_name}')
+        torch.cuda.memory._dump_snapshot(file_name)
+    except Exception as e:
+        print(f'ERROR: Failed to capture memory snapshot {e}')
+        return
+
+
+def report_mem_consumption() -> str:
+    mem_used = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)  # Convert to GB
+    mem_total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 * 1024 * 1024)
+    return f'vram:{mem_used:.1f}/{mem_total:.1f}GB'
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -308,7 +360,6 @@ class DistributedDataLoader:
             assert shard_ntok >= num_processes * B * T + 1
             ntok_total += shard_ntok
         self.ntok_total = ntok_total
-        print0(f'DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files')
 
         # kick things off
         self.reset()
@@ -371,6 +422,7 @@ if __name__ == '__main__':
             10485760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
         )
         disable_wandb: bool = False
+        memory_snapshot_steps: int = -1  # -1 to disable
 
     @dataclass
     class GPTConfig:
@@ -383,7 +435,7 @@ if __name__ == '__main__':
 
     parsed_args = parser.parse_args()
     args = Hyperparameters()
-    args.disable_wandb = parsed_args.disable_wandb
+    args.disable_wandb = args.disable_wandb or parsed_args.disable_wandb
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
@@ -441,12 +493,13 @@ if __name__ == '__main__':
     print0(f'Model Config: {model_config}', console=True)
     model = GPT(model_config)
     model = model.train().cuda()
-    if hasattr(config, 'coordinate_descent_tuning'):
-        config.coordinate_descent_tuning = True  # suggested by @Chillee
     print0('compiling the model...', console=True)
     model = torch.compile(model)
     ddp_model = DDP(model, device_ids=[ddp_local_rank])
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+
+    mem_used = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)
+    print0(f'Initing model required {mem_used:.1f}GB vram', console=True)
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B * grad_accum_steps, T, ddp_rank, ddp_world_size)
@@ -485,6 +538,9 @@ if __name__ == '__main__':
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
+    if args.memory_snapshot_steps > 0 and master_process:
+        start_record_memory_history()
+
     tokens_seen = 0
     training_time_ms = 0
     # start the clock
@@ -501,6 +557,11 @@ if __name__ == '__main__':
             training_time_ms = 0
             t0 = time.perf_counter()
         timed_steps = float('nan') if step <= 11 else (step - 10) + 1  # <= 11 to avoid bug in val
+
+        # Optionally capture memory snapshot
+        if step == args.memory_snapshot_steps and master_process:
+            export_memory_snapshot()
+            stop_record_memory_history()
 
         # once in a while evaluate the validation dataset
         if (args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step)) and (val_loader is not None):
@@ -540,9 +601,7 @@ if __name__ == '__main__':
 
             # if we hit the speedrun target, we're done
             if val_loss <= SPEEDRUN_TARGET:
-                print0(
-                    f'Speedrun target achieved at step {step} with val_loss {val_loss:.4f} at time {training_time_ms:.2f}ms !'
-                )
+                print0(f'Speedrun target achieved at step {step} with val_loss {val_loss:.4f} at time {training_time_ms:.2f}ms !')
 
         # bit confusing: we want to make sure to eval on 0th iteration
         # but also after the very last iteration. so we loop for step <= num_iterations
@@ -581,8 +640,9 @@ if __name__ == '__main__':
             tokens_seen += tokens_per_fwdbwd
             approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
             tokens_per_second = tokens_seen / (approx_time / 1000) if approx_time > 0 else 0
+            mem_str = '' if step > 10 else report_mem_consumption()
             print0(
-                f'step:{step + 1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time / timed_steps:.2f}ms tokens_seen:{tokens_seen:.2e} tokens/sec:{tokens_per_second:.2e}',
+                f'step:{step + 1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time / timed_steps:.2f}ms tokens_seen:{tokens_seen:.2e} tokens/sec:{tokens_per_second:.2e} {mem_str}',
                 console=True,
             )
             if not args.disable_wandb:
