@@ -213,6 +213,10 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
+def softcap(x, cap=1):
+    return cap * F.tanh(x / cap)
+
+
 class Rotary(torch.nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -326,8 +330,8 @@ class GPT(nn.Module):
             x = block(x)
         x = norm(x)
 
-        # if we are given some desired targets also calculate the loss
-        logits = self.lm_head(x)
+        # compute loss
+        logits = softcap(self.lm_head(x), cap=30)  # tanh logit softcap
         logits = logits.float()  # use tf32/fp32 for logits
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return loss
@@ -431,6 +435,8 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
         batch_size = 2 * 8 * 32  # global batch size, in sequences
         device_batch_size: int = 32  # batch size, in sequences, per device
         sequence_length: int = 1024  # sequence length, in tokens
+        num_iterations: int = 6120  # number of iterations to run
+        learning_rate: float = 0.000377  # muon
         emb_learning_rate: float = 0.00398  # adam
         warmup_iters: int = 0
         warmdown_iters: int = 1450
