@@ -5,6 +5,7 @@ dependencies = [
     "numpy",
     "torch>=2.5.0",
     "wandb",
+    "optuna>=4.2.1",
 ]
 
 [project.optional-dependencies]
@@ -12,7 +13,8 @@ data = [
     "datasets",
     "huggingface-hub",
     "tiktoken",
-    "tqdm"
+    "tqdm",
+    "optuna-dashboard",
 ]
 dev = [
     "ipykernel",

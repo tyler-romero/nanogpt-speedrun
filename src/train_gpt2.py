@@ -1,6 +1,13 @@
 import argparse
+import dataclasses
+import gc
 import os
 import sys
+from contextlib import contextmanager
+
+import optuna
+import torch
+from torch.profiler import ProfilerActivity
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
@@ -79,6 +86,30 @@ def report_mem_consumption() -> str:
     mem_used = torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)  # Convert to GB
     mem_total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 * 1024 * 1024)
     return f'vram:{mem_used:.1f}/{mem_total:.1f}GB'
+
+
+# -----------------------------------------------------------------------------
+# Performance profiling
+
+
+@contextmanager
+def maybe_profile(do_profile: bool, rank: int = 0):
+    if not do_profile:
+        yield None
+        return
+
+    with torch.profiler.profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(skip_first=3, wait=1, warmup=1, active=2, repeat=1),
+        profile_memory=False,
+        with_stack=True,
+    ) as prof:
+        yield prof
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    host_name = socket.gethostname()
+    trace_file = f'trace_{host_name}_{timestamp}_rank{rank}.json'
+    prof.export_chrome_trace(trace_file)
 
 
 # -----------------------------------------------------------------------------
@@ -178,6 +209,10 @@ class Muon(torch.optim.Optimizer):
 # PyTorch nn.Module definitions for the GPT-2 model
 
 
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
+
 class Rotary(torch.nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -260,8 +295,8 @@ class Block(nn.Module):
         self.attn_scale = 1 / (2 * config.n_layer) ** 0.5
 
     def forward(self, x):
-        x = x + self.attn_scale * self.attn(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.attn_scale * self.attn(norm(x))
+        x = x + self.mlp(norm(x))
         return x
 
 
@@ -283,13 +318,13 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
-    def forward(self, idx, targets=None, return_logits=True):
+    def forward(self, idx, targets):
         # forward the GPT model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
         for block in self.transformer.h:
             x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
+        x = norm(x)
 
         # if we are given some desired targets also calculate the loss
         logits = self.lm_head(x)
@@ -381,18 +416,13 @@ class DistributedDataLoader:
 # int main
 
 
-def print0(s, console=False):
-    if master_process:
-        with open(logfile, 'a') as f:
-            if console:
-                print(s)
-            print(s, file=f)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train a GPT model.')
-    parser.add_argument('--disable_wandb', action='store_true', help='Disable wandb logging.')
-    parser.add_argument('--notes', type=str, default=None, help='Notes for the run, will be logged to wandb.')
+def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None = None):
+    parsed_args = {}
+    if trial is None:
+        parser = argparse.ArgumentParser(description='Train a GPT model.')
+        parser.add_argument('--disable_wandb', action='store_true', help='Disable wandb logging.')
+        parser.add_argument('--notes', type=str, default=None, help='Notes for the run, will be logged to wandb.')
+        parsed_args = parser.parse_args()
 
     @dataclass
     class Hyperparameters:
@@ -401,8 +431,7 @@ if __name__ == '__main__':
         batch_size = 2 * 8 * 32  # global batch size, in sequences
         device_batch_size: int = 32  # batch size, in sequences, per device
         sequence_length: int = 1024  # sequence length, in tokens
-        num_iterations: int = 6312  # number of iterations to run
-        learning_rate: float = 0.0036
+        emb_learning_rate: float = 0.00398  # adam
         warmup_iters: int = 0
         warmdown_iters: int = 1450
         weight_decay: float = 0.0
@@ -410,6 +439,7 @@ if __name__ == '__main__':
         val_tokens: int = 10_485_760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons (2^21 * 5)
         disable_wandb: bool = False
         memory_snapshot_steps: int = -1  # -1 to disable
+        do_profile: bool = False
 
     @dataclass
     class GPTConfig:
@@ -421,9 +451,13 @@ if __name__ == '__main__':
         n_embd: int = 768
         # head_dim = n_embd // n_head
 
-    parsed_args = parser.parse_args()
     args = Hyperparameters()
-    args.disable_wandb = args.disable_wandb or parsed_args.disable_wandb
+    args.disable_wandb = args.disable_wandb  # or parsed_args.disable_wandb
+
+    # Override with any provided args
+    if hparam_overrides is not None:
+        print(f'overriding hparams with: {hparam_overrides}')
+        args = dataclasses.replace(args, **hparam_overrides)
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
@@ -435,7 +469,6 @@ if __name__ == '__main__':
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
-    seed_offset = 0  # each process gets the exact same seed
 
     # args error checking and convenience variables
     B, T = args.device_batch_size, args.sequence_length
@@ -447,6 +480,13 @@ if __name__ == '__main__':
     assert args.batch_size % (B * ddp_world_size) == 0
     train_accumulation_steps = args.batch_size // (B * ddp_world_size)
     tokens_per_fwdbwd = B * T * ddp_world_size * train_accumulation_steps  # 524288
+
+    def print0(s, console=False):
+        if master_process:
+            with open(logfile, 'a') as f:
+                if console:
+                    print(s)
+                print(s, file=f)
 
     # begin logging
     if master_process:
@@ -478,6 +518,9 @@ if __name__ == '__main__':
 
     # init the model from scratch
     model_config = GPTConfig()
+    if model_overrides is not None:
+        print0(f'overriding model config with: {model_overrides}', console=True)
+        model_config = dataclasses.replace(model_config, **model_overrides)
     print0(f'Model Config: {model_config}', console=True)
     model = GPT(model_config)
     model = model.train().cuda()
@@ -506,13 +549,13 @@ if __name__ == '__main__':
     # init the optimizer(s)
     optimizer1 = torch.optim.AdamW(
         model.lm_head.parameters(),
-        lr=args.learning_rate,
+        lr=args.emb_learning_rate,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
     )
     optimizer2 = Muon(
         model.transformer.h.parameters(),
-        lr=0.1 * args.learning_rate,
+        lr=args.learning_rate,
         momentum=0.95,
     )
     optimizers = [optimizer1, optimizer2]
@@ -542,118 +585,138 @@ if __name__ == '__main__':
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     # begin training
-    train_loader.reset()
-    for step in range(args.num_iterations + 1):
-        last_step = step == args.num_iterations
-        # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-        # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-        # steps with dummy data first, and then re-initialize the model and reset the loader.
-        if step == 10:
-            training_time_ms = 0
-            t0 = time.perf_counter()
-        timed_steps = float('nan') if step <= 11 else (step - 10) + 1  # <= 11 to avoid bug in val
+    val_loss = float('inf')
+    with maybe_profile(args.do_profile, rank=ddp_rank) as prof:
+        for step in range(args.num_iterations + 1):
+            last_step = step == args.num_iterations
+            # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+            # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+            # steps with dummy data first, and then re-initialize the model and reset the loader.
+            if step == 10:
+                training_time_ms = 0
+                t0 = time.perf_counter()
+            timed_steps = float('nan') if step <= 11 else (step - 10) + 1  # <= 11 to avoid bug in val
 
-        # Optionally capture memory snapshot
-        if step == args.memory_snapshot_steps and master_process:
-            export_memory_snapshot()
-            stop_record_memory_history()
+            # Optionally capture memory snapshot
+            if step == args.memory_snapshot_steps and master_process:
+                export_memory_snapshot()
+                stop_record_memory_history()
 
-        # once in a while evaluate the validation dataset
-        if (args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step)) and (val_loader is not None):
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
-            # run validation batches
-            ddp_model.eval()
-            val_loader.reset()
-            val_loss = 0.0
-            for _ in range(val_steps):
-                x_val, y_val = val_loader.next_batch()
-                with ctx:  # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
-                    loss = ddp_model(x_val, y_val)
-                    val_loss += loss.detach()
-                    del loss
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-            val_loss /= val_steps
-            # log val loss
-            print0(
-                f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / (timed_steps - 1):.2f}ms',
-                console=True,
-            )
-            if master_process and not args.disable_wandb:
-                wandb.log(
-                    {
-                        'val_loss': val_loss,
-                        'train_time': training_time_ms,
-                        'step': step,
-                        'tokens_seen': tokens_seen,
-                        'step_avg': training_time_ms / (timed_steps - 1),
-                    }
+            # once in a while evaluate the validation dataset
+            if (args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step)) and (val_loader is not None):
+                # stop the clock
+                torch.cuda.synchronize()
+                training_time_ms += 1000 * (time.perf_counter() - t0)
+                # run validation batches
+                ddp_model.eval()
+                val_loader.reset()
+                val_loss = 0.0
+                for _ in range(val_steps):
+                    x_val, y_val = val_loader.next_batch()
+                    with ctx:  # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+                        loss = ddp_model(x_val, y_val)
+                        val_loss += loss.detach()
+                        del loss
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+                val_loss /= val_steps
+                # log val loss
+                print0(
+                    f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / (timed_steps - 1):.2f}ms',
+                    console=True,
                 )
-            # start the clock again
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
+                if master_process and not args.disable_wandb:
+                    wandb.log(
+                        {
+                            'val_loss': val_loss,
+                            'train_time': training_time_ms,
+                            'step': step,
+                            'tokens_seen': tokens_seen,
+                            'step_avg': training_time_ms / (timed_steps - 1),
+                        }
+                    )
 
-            # if we hit the speedrun target, we're done
-            if val_loss <= SPEEDRUN_TARGET:
-                print0(f'Speedrun target achieved at step {step} with val_loss {val_loss:.4f} at time {training_time_ms:.2f}ms !')
+                if master_process and trial:
+                    # report intermediate values to optuna for the purpose of pruning trials
+                    # optuna pruning does not support multi-objective optimization
+                    trial.report(val_loss, step)
+                    if trial.should_prune():
+                        print0('Trial pruned!', console=True)
+                        dist.destroy_process_group()
+                        if not args.disable_wandb:
+                            wandb.finish(exit_code=-1)
+                        model.cpu()
+                        del model
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        raise optuna.TrialPruned
 
-        # bit confusing: we want to make sure to eval on 0th iteration
-        # but also after the very last iteration. so we loop for step <= num_iterations
-        # instead of just < num_iterations (one extra due to <=), only to do
-        # the validation/sampling one last time, and then we break right here as we're done.
-        if last_step:
-            break
+                # start the clock again
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
 
-        # --------------- TRAINING SECTION BEGIN -----------------
-        ddp_model.train()
-        for i in range(1, train_accumulation_steps + 1):
-            # forward pass
-            with ctx:
-                loss = ddp_model(x, y)
-            # advance the dataset for the next batch
-            x, y = train_loader.next_batch()
-            # backward pass
-            if i < train_accumulation_steps:
-                with ddp_model.no_sync():  # there's no need to sync gradients every accumulation step
-                    loss.backward()
-            else:
-                train_loss = loss.detach()
-                loss.backward()  # sync on the last step
-        for p in ddp_model.parameters():
-            p.grad /= train_accumulation_steps
-        # step the optimizer
-        for optimizer, scheduler in zip(optimizers, schedulers):
-            optimizer.step()
-            scheduler.step()
-        # null the gradients
-        ddp_model.zero_grad(set_to_none=True)
+                # if we hit the speedrun target, we're done
+                if val_loss <= SPEEDRUN_TARGET:
+                    print0(f'Speedrun target achieved at step {step} with val_loss {val_loss:.4f} at time {training_time_ms:.2f}ms !')
 
-        # --------------- TRAINING SECTION END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
+            # bit confusing: we want to make sure to eval on 0th iteration
+            # but also after the very last iteration. so we loop for step <= num_iterations
+            # instead of just < num_iterations (one extra due to <=), only to do
+            # the validation/sampling one last time, and then we break right here as we're done.
+            if last_step:
+                break
 
-        # dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-        if master_process:
-            tokens_seen += tokens_per_fwdbwd
-            approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
-            tokens_per_second = tokens_seen / (approx_time / 1000) if approx_time > 0 else 0
-            mem_str = '' if step > 10 else report_mem_consumption()
-            print0(
-                f'step:{step + 1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time / timed_steps:.2f}ms tokens_seen:{tokens_seen:.2e} tokens/sec:{tokens_per_second:.2e} {mem_str}',
-                console=True,
-            )
-            if not args.disable_wandb:
-                wandb.log(
-                    {
-                        'train_loss': train_loss.item(),
-                        'train_time': approx_time,
-                        'step': step + 1,
-                        'step_avg': approx_time / timed_steps,
-                        'tokens_seen': tokens_seen,
-                        'lr_schedule': get_lr(step),
-                        'tokens_per_second': tokens_per_second,
-                    }
+            # --------------- TRAINING SECTION BEGIN -----------------
+            ddp_model.train()
+            for i in range(1, train_accumulation_steps + 1):
+                # forward pass
+                with ctx:
+                    loss = ddp_model(x, y)
+                # advance the dataset for the next batch
+                x, y = train_loader.next_batch()
+                # backward pass
+                if i < train_accumulation_steps:
+                    with ddp_model.no_sync():  # there's no need to sync gradients every accumulation step
+                        loss.backward()
+                else:
+                    train_loss = loss.detach()
+                    loss.backward()  # sync on the last step
+            for p in ddp_model.parameters():
+                p.grad /= train_accumulation_steps
+            # step the optimizer
+            for optimizer, scheduler in zip(optimizers, schedulers):
+                optimizer.step()
+                scheduler.step()
+            # null the gradients
+            ddp_model.zero_grad(set_to_none=True)
+
+            # --------------- TRAINING SECTION END -------------------
+            # everything that follows now is just diagnostics, prints, logging, etc.
+
+            # dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+            if master_process:
+                tokens_seen += tokens_per_fwdbwd
+                approx_time = training_time_ms + 1000 * (time.perf_counter() - t0)
+                tokens_per_second = tokens_seen / (approx_time / 1000) if approx_time > 0 else 0
+                mem_str = '' if step > 10 else report_mem_consumption()
+                print0(
+                    f'step:{step + 1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time / timed_steps:.2f}ms tokens_seen:{tokens_seen:.2e} tokens/sec:{tokens_per_second:.2e} {mem_str}',
+                    console=True,
                 )
+                if not args.disable_wandb:
+                    wandb.log(
+                        {
+                            'train_loss': train_loss.item(),
+                            'train_time': approx_time,
+                            'step': step + 1,
+                            'step_avg': approx_time / timed_steps,
+                            'tokens_seen': tokens_seen,
+                            'lr_schedule': get_lr(step),
+                            'tokens_per_second': tokens_per_second,
+                        }
+                    )
+
+            if prof:
+                prof.step()
 
     # -------------------------------------------------------------------------
     print0(f'peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB')
@@ -661,3 +724,14 @@ if __name__ == '__main__':
     dist.destroy_process_group()
     if master_process and not args.disable_wandb:
         wandb.finish()
+
+    # free up memory in case we are running trials with optuna
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+    return val_loss, training_time_ms
+
+
+if __name__ == '__main__':
+    main()
