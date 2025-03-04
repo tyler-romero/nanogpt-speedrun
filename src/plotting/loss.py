@@ -38,15 +38,18 @@ dataloading_tweaks_log_file = '../../logs/08047f73-cb01-4f47-a901-de901b2a6b6e.t
 data_dataloading_tweaks = parse_log_file(dataloading_tweaks_log_file)
 logit_softcapping_log_file = '../../logs/2dbf7fa6-561c-49bc-8aae-665fefdd9a44.txt'
 data_logit_softcaping = parse_log_file(logit_softcapping_log_file)
+flexattn_log_file = '../../logs/cf1ef5f9-9f79-4798-9360-2b174d8eb25f.txt'
+data_flexattn = parse_log_file(flexattn_log_file)
 
 # %%
 sns.set(style='whitegrid')
 plt.figure(figsize=(10, 6), facecolor='none')
 # ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_baseline, linewidth=2, label='#1 Baseline', color=sns.color_palette()[0])
 # ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_arch_tweaks, linewidth=2, label='#2.1 Architecture Tweaks', color=sns.color_palette()[1])
-ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_muon, linewidth=2, label='#2.2 Muon Optimizer', color=sns.color_palette()[2])
-ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_dataloading_tweaks, linewidth=2, label='#2.3 Dataloading Tweaks', color=sns.color_palette()[3])
+# ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_muon, linewidth=2, label='#2.2 Muon Optimizer', color=sns.color_palette()[2])
+# ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_dataloading_tweaks, linewidth=2, label='#2.3 Dataloading Tweaks', color=sns.color_palette()[3])
 ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_logit_softcaping, linewidth=2, label='#2.4 Logit Soft-capping', color=sns.color_palette()[0])
+ax = sns.lineplot(x='train_time_minutes', y='val_loss', data=data_flexattn, linewidth=2, label='#3 Longer-Context Training and Eval', color=sns.color_palette()[1])
 ax.set_xlabel('Wallclock Time (2xRTX4090-minutes)')
 ax.set_ylabel('FineWeb Val Loss (bits)')
 ax.set_ylim(3.25, 4.0)
@@ -54,7 +57,7 @@ ax.set_xlim(0, ax.get_xlim()[1])
 ax.axhline(3.28, color='r', linestyle='--', label='Speedrun Target')
 plt.gca().set_facecolor('none')
 plt.legend()
-plt.savefig('plots/2p4_loss_plot.png', facecolor=plt.gca().get_facecolor(), bbox_inches='tight', dpi=300)
+plt.savefig('plots/3_loss_plot.png', facecolor=plt.gca().get_facecolor(), bbox_inches='tight', dpi=300)
 plt.show()
 
 # %%

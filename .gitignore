@@ -170,9 +170,16 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# JS
+node_modules/
+package-lock.json
+package.json
+
 # repo specific
 *.bin
 logs/
 profiling/
 wandb/
 .vscode/
+*.db
+CLAUDE.md

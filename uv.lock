@@ -882,6 +882,7 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "optuna" },
+    { name = "tiktoken" },
     { name = "torch" },
     { name = "wandb" },
 ]
@@ -891,7 +892,6 @@ data = [
     { name = "datasets" },
     { name = "huggingface-hub" },
     { name = "optuna-dashboard" },
-    { name = "tiktoken" },
     { name = "tqdm" },
 ]
 dev = [
@@ -910,7 +910,7 @@ requires-dist = [
     { name = "optuna", specifier = ">=4.2.1" },
     { name = "optuna-dashboard", marker = "extra == 'data'" },
     { name = "seaborn", marker = "extra == 'dev'" },
-    { name = "tiktoken", marker = "extra == 'data'" },
+    { name = "tiktoken" },
     { name = "torch", specifier = ">=2.5.0" },
     { name = "tqdm", marker = "extra == 'data'" },
     { name = "wandb" },

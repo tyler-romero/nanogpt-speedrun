@@ -1,31 +1,31 @@
-import argparse
-import dataclasses
-import gc
 import os
 import sys
-from contextlib import contextmanager
-
-import optuna
-import torch
-from torch.profiler import ProfilerActivity
 
 with open(sys.argv[0]) as f:
     code = f.read()  # read the code of this file ASAP, for logging
 
+import argparse
+import dataclasses
+import gc
 import glob
 import socket
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
+import optuna
+import tiktoken
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention.flex_attention import and_masks, create_block_mask, flex_attention
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.profiler import ProfilerActivity
 
 import wandb
 
@@ -217,6 +217,9 @@ def softcap(x, cap=1):
     return cap * F.tanh(x / cap)
 
 
+flex_attention = torch.compile(flex_attention, dynamic=False)
+
+
 class Rotary(torch.nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -260,7 +263,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
 
-    def forward(self, x):
+    def forward(self, x, block_mask):
         B, T, C = x.size()  # batch size, sequence length, embedding dim (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
@@ -271,6 +274,11 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)  # changes direction but not magnitude
+        q = q.transpose(1, 2)  # (B, H, T, D)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        y: torch.Tensor = flex_attention(q, k, v, block_mask=block_mask)  # type: ignore # (B, H, T, D)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -298,8 +306,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.attn_scale = 1 / (2 * config.n_layer) ** 0.5
 
-    def forward(self, x):
-        x = x + self.attn_scale * self.attn(norm(x))
+    def forward(self, x, block_mask):
+        x = x + self.attn_scale * self.attn(norm(x), block_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -312,6 +320,7 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.eot_token = tiktoken.get_encoding('gpt2')._special_tokens['<|endoftext|>']  # 50256
 
         self.transformer = nn.ModuleDict(
             dict(
@@ -322,12 +331,39 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
+    def get_attn_mask(self, idx):
+        # idx: shape (b, t)
+        # Track document boundaries by detecting EOT tokens and doing a cumulative sum
+        # This gives each token a "document ID" - tokens in the same document have the same ID
+        documents = (idx == self.eot_token).cumsum(dim=1)  # dim=1 for sequence dimension, not batch
+
+        def document_mask(b, h, q_idx, kv_idx):
+            # Only allow attention between tokens in the same document
+            return documents[b, q_idx] == documents[b, kv_idx]
+
+        def causal_mask(b, h, q_idx, kv_idx):
+            # Standard causal mask - only attend to past tokens
+            return q_idx >= kv_idx
+
+        def sliding_window_mask(b, h, q_idx, kv_idx):
+            return q_idx - kv_idx <= 1024
+
+        # Combine document and causal masks - tokens can only attend to past tokens in the same document
+        return and_masks(document_mask, causal_mask, sliding_window_mask)
+
+    def get_block_mask(self, idx):
+        # compute block mask once per batch to ammortize the cost of this computation
+        B, T = idx.size()
+        attn_mask = self.get_attn_mask(idx)
+        return create_block_mask(attn_mask, B=B, H=None, Q_LEN=T, KV_LEN=T, _compile=True)
+
     def forward(self, idx, targets):
         # forward the GPT model itself
+        block_mask = self.get_block_mask(idx)
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, block_mask)
         x = norm(x)
 
         # compute loss
@@ -413,7 +449,7 @@ class DistributedDataLoader:
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+        return x.cuda(non_blocking=True), y.cuda(non_blocking=True)
 
 
 # -----------------------------------------------------------------------------
@@ -432,14 +468,14 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
     class Hyperparameters:
         input_bin: str = 'src/data/fineweb10B/fineweb_train_*.bin'
         input_val_bin: str = 'src/data/fineweb10B/fineweb_val_*.bin'
-        batch_size = 2 * 8 * 32  # global batch size, in sequences
-        device_batch_size: int = 32  # batch size, in sequences, per device
-        sequence_length: int = 1024  # sequence length, in tokens
-        num_iterations: int = 6120  # number of iterations to run
+        batch_size = 2 * 8  # global batch size, in sequences
+        device_batch_size: int = 1  # batch size, in sequences, per device
+        sequence_length: int = 32_768  # sequence length, in tokens
+        num_iterations: int = 3584  # number of iterations to run
         learning_rate: float = 0.000377  # muon
         emb_learning_rate: float = 0.00398  # adam
         warmup_iters: int = 0
-        warmdown_iters: int = 1450
+        warmdown_iters: int = 938
         weight_decay: float = 0.0
         val_loss_every: int = 128
         val_tokens: int = 10_485_760  # how many tokens of validation data? it's important to keep this fixed for consistent comparisons (2^21 * 5)
@@ -455,7 +491,10 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
         n_layer: int = 12
         n_head: int = 12
         n_embd: int = 768
-        # head_dim = n_embd // n_head
+
+        def __post_init__(self):
+            assert self.n_embd % self.n_head == 0
+            self.head_dim = self.n_embd // self.n_head
 
     args = Hyperparameters()
     args.disable_wandb = args.disable_wandb  # or parsed_args.disable_wandb
@@ -478,14 +517,13 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
 
     # args error checking and convenience variables
     B, T = args.device_batch_size, args.sequence_length
-    assert 1 <= T <= 1024
     # calculate the number of steps to take in the val loop.
     assert args.val_tokens % (B * T * ddp_world_size) == 0
     val_steps = args.val_tokens // (B * T * ddp_world_size)
     # calculate the steps of gradient accumulation required to attain the desired global batch size.
     assert args.batch_size % (B * ddp_world_size) == 0
     train_accumulation_steps = args.batch_size // (B * ddp_world_size)
-    tokens_per_fwdbwd = B * T * ddp_world_size * train_accumulation_steps  # 524288
+    tokens_per_fwdbwd = B * T * ddp_world_size * train_accumulation_steps
 
     def print0(s, console=False):
         if master_process:
@@ -507,10 +545,7 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
     print0(f'Running pytorch {torch.version.__version__}')
     print(f'using device: {device}')
     print0(f'Hyperparameters: {args}', console=True)
-    print0(
-        f'{B=} {T=} {ddp_world_size=} {train_accumulation_steps=} {tokens_per_fwdbwd=} {args.batch_size=}',
-        console=True,
-    )
+    print0(f'{tokens_per_fwdbwd=} ({B=} {T=} {ddp_world_size=} {train_accumulation_steps=} {args.batch_size=})', console=True)
 
     # begin by printing this file (the Python code)
     print0('=' * 100)
@@ -530,8 +565,9 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
     print0(f'Model Config: {model_config}', console=True)
     model = GPT(model_config)
     model = model.train().cuda()
-    print0('compiling the model...', console=True)
-    model = torch.compile(model)
+    print0('Compiling the model...', console=True)
+    # torch._dynamo.config.capture_scalar_outputs = True
+    model = torch.compile(model, dynamic=False)
     ddp_model = DDP(model, device_ids=[ddp_local_rank])
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
@@ -609,7 +645,7 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
                 stop_record_memory_history()
 
             # once in a while evaluate the validation dataset
-            if (args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step)) and (val_loader is not None):
+            if args.val_loss_every > 0 and (step % args.val_loss_every == 0 or last_step):
                 # stop the clock
                 torch.cuda.synchronize()
                 training_time_ms += 1000 * (time.perf_counter() - t0)
