@@ -16,10 +16,11 @@ data = [
     "tqdm",
     "optuna-dashboard",
 ]
-dev = [
+plotting = [
     "ipykernel",
     "matplotlib",
-    "seaborn"
+    "seaborn",
+    "transformers",
 ]
 
 [build-system]
