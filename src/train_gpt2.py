@@ -15,6 +15,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import optuna
@@ -45,8 +46,9 @@ SPEEDRUN_TARGET = 3.28
 # Keep a max of 100,000 alloc/free events in the recorded history
 # leading up to the snapshot.
 MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
-PROFILING_DIR = './profiling'
-os.makedirs(PROFILING_DIR, exist_ok=True)
+PROFILING_DIR = Path('./profiling')
+MEM_PROFILING_DIR = PROFILING_DIR / 'mem'
+PERF_PROFILING_DIR = PROFILING_DIR / 'perf'
 
 
 def start_record_memory_history() -> None:
@@ -70,13 +72,14 @@ def export_memory_snapshot() -> None:
         raise RuntimeError()
 
     host_name = socket.gethostname()
-    timestamp = datetime.now().timestamp()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     file_prefix = f'{host_name}_{timestamp}'
-    file_name = f'{PROFILING_DIR}/{file_prefix}.pickle'
+    MEM_PROFILING_DIR.mkdir(exist_ok=True)
+    file_path = MEM_PROFILING_DIR / f'{file_prefix}.pickle'
 
     try:
-        print(f'Saving snapshot to local file: {file_name}')
-        torch.cuda.memory._dump_snapshot(file_name)
+        print(f'Saving snapshot to local file: {file_path}')
+        torch.cuda.memory._dump_snapshot(str(file_path))
     except Exception as e:
         print(f'ERROR: Failed to capture memory snapshot {e}')
         return
@@ -107,9 +110,9 @@ def maybe_profile(do_profile: bool, rank: int = 0):
         yield prof
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    host_name = socket.gethostname()
-    trace_file = f'trace_{host_name}_{timestamp}_rank{rank}.json'
-    prof.export_chrome_trace(trace_file)
+    PERF_PROFILING_DIR.mkdir(exist_ok=True)
+    trace_file_path = PERF_PROFILING_DIR / f'trace_{timestamp}_rank{rank}.json'
+    prof.export_chrome_trace(str(trace_file_path))
 
 
 # -----------------------------------------------------------------------------
@@ -209,6 +212,12 @@ class Muon(torch.optim.Optimizer):
 # PyTorch nn.Module definitions for the GPT-2 model
 
 
+def count_parameters(model: nn.Module):
+    embedding_params = sum(p.numel() for name, p in model.named_parameters() if p.requires_grad and 'wte' in name)
+    non_embedding_params = sum(p.numel() for name, p in model.named_parameters() if p.requires_grad and 'wte' not in name)
+    return embedding_params + non_embedding_params, embedding_params, non_embedding_params
+
+
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -221,9 +230,9 @@ flex_attention = torch.compile(flex_attention, dynamic=False)
 
 
 class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, base_theta=10000):  # TODO: increase base theta to 500k (as per llama3)
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (base_theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
         self.seq_len_cached = None
         self.cos_cached = None
@@ -565,6 +574,8 @@ def main(hparam_overrides=None, model_overrides=None, trial: optuna.Trial | None
     print0(f'Model Config: {model_config}', console=True)
     model = GPT(model_config)
     model = model.train().cuda()
+    total_params, embedding_params, non_embedding_params = count_parameters(model)
+    print0(f'Total params: {total_params / 1e6:.2f}M, embedding params: {embedding_params / 1e6:.2f}M, non-embedding params: {non_embedding_params / 1e6:.2f}M', console=True)
     print0('Compiling the model...', console=True)
     # torch._dynamo.config.capture_scalar_outputs = True
     model = torch.compile(model, dynamic=False)
